@@ -1825,10 +1825,9 @@ def run_all_and_send(uid: int, st: dict):
 # ---------- ОБРАБОТЧИКИ CALLBACK-КНОПОК МУЗЫКИ ----------
 @bot.callback_query_handler(func=lambda call: call.data.startswith("listen_"))
 def on_music_listen(call):
-    """Обработчик прослушивания музыки"""
     uid = call.from_user.id
     music_name = call.data.replace("listen_", "")
-    music_path = find_music_by_name(music_name)
+    music_path = MUSIC_BY_CLEAN.get(music_name)   # ← без find_music_by_name
 
     if music_path and os.path.isfile(music_path):
         try:
@@ -1840,9 +1839,9 @@ def on_music_listen(call):
     else:
         bot.answer_callback_query(call.id, "Файл не найден")
 
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("select_music_"))
 def on_music_select(call):
-    """Обработчик выбора музыки"""
     uid = call.from_user.id
     st = users.setdefault(uid, new_state())
 
@@ -1852,21 +1851,13 @@ def on_music_select(call):
         st["music"] = None
         bot.answer_callback_query(call.id, "🔇 Выбрано: Без музыки")
     else:
-        # Находим полное имя музыки с эмодзи
-        full_name = None
-        for key in MUSIC.keys():
-            if key.replace("🎵 ", "") == music_choice:
-                full_name = key
-                break
-
-        if full_name:
-            st["music"] = full_name
+        if music_choice in MUSIC_BY_CLEAN:
+            st["music"] = f"🎵 {music_choice}"        # храним ключ, как в меню
             bot.answer_callback_query(call.id, f"✅ Выбрано: {music_choice}")
         else:
             bot.answer_callback_query(call.id, "Музыка не найдена")
             return
 
-    # Переход к следующему шагу
     if not st["scenes"]:
         bot.send_message(uid, "Ошибка: не выбраны сюжеты. Начните с /start")
         return
