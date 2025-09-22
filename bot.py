@@ -195,11 +195,11 @@ MAX_UPSCALE = float(os.environ.get("MAX_UPSCALE", "1.45"))
 # Минимальные «видимые» высоты силуэтов (доля от H), чтобы не выглядели «карликами»
 # Ключ: (формат, count_people) -> минимальная видимая высота bbox по альфе / H
 MIN_VISIBLE_FRAC = {
-    ("🧍 В рост", 1): 0.86,
-    ("🧍 В рост", 2): 0.80,
-    ("👨‍💼 По пояс", 1): 0.66,
+    ("🧍 В рост", 1): 0.70,
+    ("🧍 В рост", 2): 0.70,
+    ("👨‍💼 По пояс", 1): 0.60,
     ("👨‍💼 По пояс", 2): 0.60,
-    ("👨‍💼 По грудь", 1): 0.56,
+    ("👨‍💼 По грудь", 1): 0.50,
     ("👨‍💼 По грудь", 2): 0.50,
 }
 
@@ -207,26 +207,26 @@ def _min_frac_for(format_key: str, count_people: int) -> float:
     # Базовый дефолт на случай новых форматов
     return MIN_VISIBLE_FRAC.get((format_key, count_people), 0.60)
 # --- Целевые высоты силуэтов (доля от высоты кадра) ---
-TH_FULL_SINGLE   = 0.73
-TH_FULL_DOUBLE   = 0.68
-TH_WAIST_SINGLE  = 0.68
-TH_WAIST_DOUBLE  = 0.64
-TH_CHEST_SINGLE  = 0.62
-TH_CHEST_DOUBLE  = 0.58
+TH_FULL_SINGLE   = 0.70
+TH_FULL_DOUBLE   = 0.70
+TH_WAIST_SINGLE  = 0.60
+TH_WAIST_DOUBLE  = 0.60
+TH_CHEST_SINGLE  = 0.50
+TH_CHEST_DOUBLE  = 0.50
 
 # Audio files are now real MP3 files provided by user
 # No need to create placeholder sounds anymore
 
 # Минимальная доля высоты кадра, которую должна занимать фигура/группа (anti-micro-people)
 MIN_SINGLE_FRAC = {
-    "В рост": 0.86,
-    "По пояс": 0.76,
-    "По грудь": 0.68,
+    "В рост": 0.70,
+    "По пояс": 0.60,
+    "По грудь": 0.50,
 }
 MIN_PAIR_FRAC = {
-    "В рост": 0.72,
-    "По пояс": 0.65,
-    "По грудь": 0.60,
+    "В рост": 0.70,
+    "По пояс": 0.60,
+    "По грудь": 0.50,
 }
 # Мягкий предел апскейла для финального «подрастания» (от текущего target_h)
 PAIR_UPSCALE_CAP = 1.22   # не увеличиваем целевую высоту более чем на 22% за один пасс
@@ -1908,6 +1908,45 @@ def make_start_frame(photo_paths: List[str], framing_key: str, bg_file: str, lay
                 # и заново в границы
                 lx = max(margin, min(W - L.width - margin, lx))
                 rx = max(margin, min(W - R.width - margin, rx))
+                
+        # --- Выравнивание пропорций (match-scale) -----------------------------
+        # Сводим видимые высоты L и R к соотношению 1.00±5%, сохраняя "пол".
+        def _vis_h(img: Image.Image) -> int:
+            bb, yb = alpha_metrics(img)
+            return max(1, (yb - bb[1] + 1))
+
+        if len(cuts) == 2:
+            hL, hR = _vis_h(L), _vis_h(R)
+            if hL > 0 and hR > 0:
+                ratio = hL / float(hR)
+                TOL = 0.05
+                if ratio > (1.0 + TOL) or ratio < (1.0 - TOL):
+                    # приводим бОльшую высоту к меньшей (делаем их ближе)
+                    target = (hL + hR) / 2.0
+                    # масштаб относительно исходной ширины/высоты
+                    def _scale_to_height(img: Image.Image, target_h: float) -> Image.Image:
+                        k = max(0.5, min(1.5, target_h / float(_vis_h(img))))
+                        nw, nh = max(1, int(img.width * k)), max(1, int(img.height * k))
+                        return img.resize((nw, nh), RESAMPLE.LANCZOS)
+
+                    # пересчёт так, чтобы обе были рядом (±5%)
+                    L = _scale_to_height(L, target)
+                    R = _scale_to_height(R, target)
+                    yl = place_y_for_floor(L)
+                    yr = place_y_for_floor(R)
+
+                    # вернуть в рамки по X
+                    margin = 20
+                    lx = max(margin, min(W - L.width - margin, lx))
+                    rx = max(margin, min(W - R.width - margin, rx))
+
+                    # если снова слиплись — чуть раздвинем
+                    ra = rect_at(lx, yl, L)
+                    rb = rect_at(rx, yr, R)
+                    if horizontal_overlap(ra, rb):
+                        gap = max(4, int(0.01 * W))
+                        lx = max(margin, lx - gap)
+                        rx = min(W - R.width - margin, rx + gap)
 
         # --- Применяем layout_hint (масштаб/сдвиг для L/R), затем «автоподтяжка» ближе без перекрытия
         try:
@@ -2061,6 +2100,28 @@ def make_start_frame(photo_paths: List[str], framing_key: str, bg_file: str, lay
             target_h = new_target
             grow_tries += 1
 
+        # --- Верхний предел видимого роста (чтобы не > 0.72 экрана)
+        MAX_VISIBLE_FRAC = 0.72 if framing_key in ("🧍 В рост", "в рост") else 0.80
+        def _shrink_to_max(img: Image.Image) -> Image.Image:
+            frac = _visible_frac(img)
+            if frac <= MAX_VISIBLE_FRAC:
+                return img
+            k = max(0.5, min(1.0, MAX_VISIBLE_FRAC / max(1e-6, frac)))
+            nw, nh = max(1, int(img.width * k)), max(1, int(img.height * k))
+            return img.resize((nw, nh), RESAMPLE.LANCZOS)
+
+        if len(cuts) == 1:
+            P = _shrink_to_max(P)
+            y = place_y_for_floor(P)
+        else:
+            L = _shrink_to_max(L); R = _shrink_to_max(R)
+            yl = place_y_for_floor(L); yr = place_y_for_floor(R)
+            # сохранить центры по X
+            lcx = lx + L.width // 2
+            rcx = rx + R.width // 2
+            lx = max(20, min(W - L.width - 20, lcx - L.width // 2))
+            rx = max(20, min(W - R.width - 20, rcx - R.width // 2))
+        
         # финальная проверка на перекрытия после роста (на всякий)
         ra = rect_at(lx, yl, L)
         rb = rect_at(rx, yr, R)
@@ -2071,6 +2132,21 @@ def make_start_frame(photo_paths: List[str], framing_key: str, bg_file: str, lay
             if rx + R.width // 2 > center:
                 rx = min(W - R.width - margin, rx + 8)
 
+        # --- Жёсткий зазор на старте
+        def _inner_gap_px(a, b): return max(0, b[0] - a[2])
+        ra = rect_at(lx, yl, L); rb = rect_at(rx, yr, R)
+        min_ideal_gap = max(MIN_GAP_PX, int(0.05 * W))
+        tries = 0
+        while (_inner_gap_px(ra, rb) < min_ideal_gap) and tries < 60:
+            # симметрично разводим от центра
+            center = W // 2
+            if lx + L.width // 2 <= center: lx = max(20, lx - 2)
+            else:                            lx = min(W - L.width - 20, lx + 2)
+            if rx + R.width // 2 >= center:  rx = min(W - R.width - 20, rx + 2)
+            else:                            rx = max(20, rx - 2)
+            ra = rect_at(lx, yl, L); rb = rect_at(rx, yr, R)
+            tries += 1
+        
         draw_with_shadow(canvas, L, lx, yl)
         draw_with_shadow(canvas, R, rx, yr)
         # Диагностический оверлей (по желанию)
@@ -2577,6 +2653,32 @@ def cmd_jpeg(m: telebot.types.Message):
     bot.reply_to(m, f"RUNWAY_SEND_JPEG = {RUNWAY_SEND_JPEG}")
 
 # ---------- ПАЙПЛАЙН ----------
+# === HARD-OFF for OpenAI Assistants (safe stub layer) =========================
+# Отключаем любые проверки/добавки от Assistant'а и делаем функции-стабы.
+
+try:
+    ASSISTANT_GATE_ENABLED = False  # на всякий — принудительно OFF
+except NameError:
+    pass
+
+def _short_gate(g: dict | None) -> str:  # используется в превью — оставим нейтральный вывод
+    return "gate: disabled"
+
+def _normalize_gate(g: dict | None) -> dict | None:
+    return None
+
+def oai_upload_image(path: str) -> str | None:
+    # не загружаем ничего в Assistants
+    return None
+
+def oai_create_thread_with_image(user_text: str, file_id: str) -> str | None:
+    # не создаём thread в Assistants
+    return None
+
+def oai_gate_check(start_frame_path: str, base_prompt: str, meta: dict, timeout_sec: int = 120) -> dict | None:
+    # всегда «без вмешательства»: возвращаем None
+    return None
+# ==============================================================================
 def run_all_and_send(uid: int, st: dict):
     framing_text = FORMATS[st["format"]]
     bg_prompt    = BG_TEXT[st["bg"]]          # текст-описание для лёгкой анимации
@@ -2590,6 +2692,13 @@ def run_all_and_send(uid: int, st: dict):
         start_frame_draft = make_start_frame(st["photos"], st["format"], bg_file, layout=None)
         base_prompt = build_prompt(scene["kind"], framing_text, bg_prompt, scene["duration"])
 
+        base_prompt += (
+            "; lock geometry exactly as in the provided start frame (positions and scales)"
+            "; no zoom, no dolly, no push-in/out, no drift; keep constant relative size"
+            "; full-body shot; preserve limb topology; no body/limb deformation; no warping"
+            "; do not change background plate geometry; do not crop heads, hands, or feet"
+        )
+        
         # 2) прогон через ассистента (мягкая модерация + дополнения к промпту)
         gate = None
         try:
